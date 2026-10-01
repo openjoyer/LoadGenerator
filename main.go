@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,12 +25,13 @@ type Stage struct {
 	Duration time.Duration
 }
 type Config struct {
-	URL                                        string
-	Stages                                     []Stage
-	Concurrency, Batch, MessageBytes, Services int
-	MemoryMiB                                  int
-	Timeout                                    time.Duration
-	Format, Key, RunID                         string
+	Targets     []Target
+	URL         string
+	Stages      []Stage
+	Concurrency int
+	MemoryMiB   int
+	Timeout     time.Duration
+	Key, RunID  string
 }
 
 func parseStages(s string) ([]Stage, error) {
@@ -57,11 +59,16 @@ func (c Config) validate() error {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
 		return fmt.Errorf("url must be HTTP(S), without embedded credentials")
 	}
-	if c.Concurrency < 1 || c.Concurrency > 100000 || c.Batch < 1 || c.Batch > 500 || c.MessageBytes < 1 || c.MessageBytes > 10000 || c.Services < 1 || c.Services > 10000 || c.MemoryMiB < 1 || c.MemoryMiB > 65536 || c.Timeout <= 0 {
-		return fmt.Errorf("invalid limits: concurrency 1..100000, batch 1..500, message-bytes 1..10000, services 1..10000, memory-mib 1..65536; timeout > 0")
+	if c.Concurrency < 1 || c.Concurrency > 100000 || c.MemoryMiB < 1 || c.MemoryMiB > 65536 || c.Timeout <= 0 {
+		return fmt.Errorf("invalid concurrency, memory or timeout")
 	}
-	if c.Format != "logflux" && c.Format != "legacy" {
-		return fmt.Errorf("format must be logflux or legacy")
+	if err := validateTargets(c.Targets); err != nil {
+		return err
+	}
+	for _, stage := range c.Stages {
+		if stage.RPS < 1 || stage.RPS > 1000000 || stage.Duration < time.Millisecond || stage.Duration > 24*time.Hour {
+			return fmt.Errorf("invalid stage: RPS 1..1000000, duration 1ms..24h required")
+		}
 	}
 	if len(c.Stages) == 0 {
 		return fmt.Errorf("at least one stage required")
@@ -71,41 +78,30 @@ func (c Config) validate() error {
 
 func main() {
 	if err := execute(); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
 func execute() error {
-	var c Config
-	var stages, keyEnv, reportPath, sink string
-	flag.StringVar(&c.URL, "url", "http://localhost:8080/api/v1/logs", "target endpoint")
-	flag.StringVar(&stages, "stages", "100@10s", "comma-separated RPS@duration, e.g. 100@30s,1000@60s")
-	flag.IntVar(&c.Concurrency, "concurrency", 128, "maximum requests in flight")
-	flag.IntVar(&c.Batch, "batch", 100, "events per request")
-	flag.IntVar(&c.MessageBytes, "message-bytes", 512, "message field bytes, not total event size")
-	flag.IntVar(&c.Services, "services", 20, "number of synthetic service names")
-	flag.IntVar(&c.MemoryMiB, "memory-mib", 128, "budget for reusable payload buffers, not process RSS")
-	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "whole request timeout")
-	flag.StringVar(&c.Format, "format", "logflux", "logflux: camelCase envelope; legacy: snake_case array")
-	flag.StringVar(&keyEnv, "key-env", "LOGFLUX_API_KEY", "environment variable containing Bearer token")
-	flag.StringVar(&reportPath, "report", "report.json", "JSON report path (replaced if it exists)")
-	flag.StringVar(&sink, "sink", "", "run a local body-draining test server, e.g. 127.0.0.1:8090")
-	flag.Parse()
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	if sink != "" {
-		return serveSink(ctx, sink)
-	}
-	var err error
-	c.Stages, err = parseStages(stages)
+	opts, err := loadOptions(os.Args[1:])
 	if err != nil {
 		return err
 	}
-	if err = c.validate(); err != nil {
-		return err
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if opts.Sink != "" {
+		return serveSink(ctx, opts.Sink)
 	}
-	c.Key = os.Getenv(keyEnv)
+	c, reportPath := opts.Config, opts.Report
+	printPlan(os.Stdout, c, reportPath)
+	if opts.Check {
+		fmt.Println("Configuration OK")
+		return nil
+	}
 	var id [8]byte
 	if _, err = rand.Read(id[:]); err != nil {
 		return err
@@ -132,12 +128,8 @@ func serveSink(ctx context.Context, address string) error {
 		return err
 	}
 	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(405)
-			return
-		}
 		defer r.Body.Close()
-		if _, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 1<<20)); err != nil {
+		if _, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 16<<20)); err != nil {
 			w.WriteHeader(413)
 			return
 		}

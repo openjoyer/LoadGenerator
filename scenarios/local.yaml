@@ -1,0 +1,24 @@
+# Receiver: ./bin/load-generator -sink 127.0.0.1:8090
+targets:
+  - name: local
+    url: http://127.0.0.1:8090/
+    weight: 1
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_template: '{"requestId":"{{uuid}}","timestamp":"{{timestamp}}","data":"{{random:512}}"}'
+    expected_status: [202]
+load:
+  stages:
+    - rps: 100
+      duration: 10s
+    - rps: 1000
+      duration: 20s
+    - rps: 5000
+      duration: 20s
+limits:
+  concurrency: 256
+  payload_memory_mib: 128
+  request_timeout: 5s
+report:
+  path: ./report-local.json

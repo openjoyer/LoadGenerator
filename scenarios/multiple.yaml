@@ -1,0 +1,21 @@
+# Start receivers on BOTH 8090 and 8091.
+targets:
+  - name: read
+    url: http://127.0.0.1:8090/items
+    weight: 80
+    method: GET
+  - name: write
+    url: http://127.0.0.1:8091/items
+    weight: 20
+    method: PUT
+    headers:
+      Content-Type: application/json
+    body_template: '{"id":"{{uuid}}","value":"{{random:128}}"}'
+load:
+  stages:
+    - rps: 1000
+      duration: 30s
+limits:
+  concurrency: 256
+report:
+  path: ./report-multiple.json

@@ -23,14 +23,19 @@ type metrics struct {
 	latency, lag                                                      [buckets]uint64
 	maxLatency, maxLag                                                int64
 }
+type TargetReport struct {
+	Name                     string
+	Started, Success, Errors uint64
+}
 type Report struct {
-	RunID                                                     string  `json:"run_id"`
-	Interrupted                                               bool    `json:"interrupted"`
-	Stages                                                    []Stage `json:"stages"`
+	Targets                                                   []TargetReport `json:"targets"`
+	RunID                                                     string         `json:"run_id"`
+	Interrupted                                               bool           `json:"interrupted"`
+	Stages                                                    []Stage        `json:"stages"`
 	Scheduled, Submitted, Started, Completed, Success, Missed uint64
 	TransportErrors, ResponseErrors                           uint64
 	SubmittedPayloadBytes                                     uint64
-	EventsPerRequest, PayloadBytes, Concurrency               int
+	PayloadBytes, Concurrency                                 int
 	Statuses                                                  map[int]uint64
 	LatencyP50, LatencyP95, LatencyP99                        string
 	StartLagP99                                               string
@@ -121,25 +126,28 @@ func Run(ctx context.Context, c Config, output io.Writer) (Report, error) {
 	if err := c.validate(); err != nil {
 		return Report{}, err
 	}
+	if len(c.Targets) == 0 {
+		c.Targets = []Target{{Name: "default", URL: c.URL, Weight: 1, Method: "GET", Key: c.Key}}
+	}
+	for i := range c.Targets {
+		if c.Targets[i].compiled == nil {
+			if err := prepareTarget(&c.Targets[i], "."); err != nil {
+				return Report{}, err
+			}
+		}
+	}
+	targetStarted := make([]atomic.Uint64, len(c.Targets))
+	targetSuccess := make([]atomic.Uint64, len(c.Targets))
+	targetErrors := make([]atomic.Uint64, len(c.Targets))
 	prefix, err := runPrefix(c.RunID)
 	if err != nil {
 		return Report{}, err
 	}
-	sample := newPayload(c, 0)
-	size := len(sample.body)
-	if size > 1<<20 {
-		return Report{}, fmt.Errorf("payload %d bytes exceeds 1 MiB", size)
+	size, workers, err := payloadPlan(c)
+	if err != nil {
+		return Report{}, err
 	}
-	allocationSize := cap(sample.body)
-	workers := c.Concurrency
-	budget := int64(c.MemoryMiB) << 20
-	if int64(workers)*int64(allocationSize) > budget {
-		workers = int(budget / int64(allocationSize))
-	}
-	if workers < 1 {
-		return Report{}, fmt.Errorf("payload memory budget too small")
-	}
-	fmt.Fprintf(output, "run=%s workers=%d payload≈%d bytes batch=%d; no application retries; HTTP/1.1\n", c.RunID, workers, size, c.Batch)
+	fmt.Fprintf(output, "run=%s workers=%d max_body=%d bytes; no application retries; HTTP/1.1\n", c.RunID, workers, size)
 	transport := &http.Transport{
 		Proxy:        http.ProxyFromEnvironment,
 		DialContext:  (&net.Dialer{Timeout: c.Timeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -156,23 +164,30 @@ func Run(ctx context.Context, c Config, output io.Writer) (Report, error) {
 	for w := 0; w < workers; w++ {
 		m := &metrics{statuses: map[int]uint64{}}
 		all[w] = m
-		p := newPayload(c, w)
+		payloads := make([]*payload, len(c.Targets))
+		for i, t := range c.Targets {
+			payloads[i] = t.compiled.clone(w)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				p.update(prefix, j.sequence, c.Batch)
+
+				targetIndex := chooseTarget(j.sequence, c.Targets)
+				target := c.Targets[targetIndex]
+				p := payloads[targetIndex]
+				p.update(prefix, j.sequence, 0)
 				reader := bytes.NewReader(p.body)
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, io.NopCloser(reader))
+				req, err := http.NewRequestWithContext(ctx, target.Method, target.URL, io.NopCloser(reader))
 				if err != nil {
 					<-slots
 					continue
 				}
 				req.ContentLength = int64(len(p.body))
-				req.Header.Set("Content-Type", "application/json")
-				if c.Key != "" {
-					req.Header.Set("Authorization", "Bearer "+c.Key)
+				for k, v := range target.Headers {
+					req.Header.Set(k, v)
 				}
+				targetStarted[targetIndex].Add(1)
 				started := time.Now()
 				lag := started.Sub(j.due).Nanoseconds()
 				if lag < 0 {
@@ -198,6 +213,11 @@ func Run(ctx context.Context, c Config, output io.Writer) (Report, error) {
 					}
 					_ = resp.Body.Close()
 				}
+				if sendErr == nil && bodyErr == nil && expected(target, status) {
+					targetSuccess[targetIndex].Add(1)
+				} else {
+					targetErrors[targetIndex].Add(1)
+				}
 				latency := time.Since(started).Nanoseconds()
 				m.mu.Lock()
 				m.completed++
@@ -212,7 +232,7 @@ func Run(ctx context.Context, c Config, output io.Writer) (Report, error) {
 					m.networkErrors++
 				} else if bodyErr != nil {
 					m.responseErrors++
-				} else if status >= 200 && status < 300 {
+				} else if expected(target, status) {
 					m.success++
 				}
 				m.mu.Unlock()
@@ -316,7 +336,10 @@ outer:
 	m := snapshot(all)
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	r := Report{RunID: c.RunID, Interrupted: interrupted, Stages: c.Stages, Scheduled: scheduled.Load(), Submitted: submitted.Load(), Started: m.started, Completed: m.completed, Success: m.success, Missed: missed.Load(), TransportErrors: m.networkErrors, ResponseErrors: m.responseErrors, SubmittedPayloadBytes: m.bytes, EventsPerRequest: c.Batch, PayloadBytes: size, Concurrency: workers, Statuses: m.statuses, LatencyP50: percentile(m.latency, m.completed, .5, m.maxLatency).String(), LatencyP95: percentile(m.latency, m.completed, .95, m.maxLatency).String(), LatencyP99: percentile(m.latency, m.completed, .99, m.maxLatency).String(), StartLagP99: percentile(m.lag, m.started, .99, m.maxLag).String(), LoadSeconds: loadSeconds, TotalSeconds: time.Since(start).Seconds(), AchievedStartRPS: float64(m.started) / loadSeconds, HeapBytes: mem.HeapAlloc, Notes: "Success means HTTP 2xx, not persisted events. Payload bytes are attempted, not measured network bytes. Latencies include body reading; start lag is separate. Histogram percentiles are approximate upper bounds. Stages durations are nanoseconds. Random messages are a synthetic compression stress profile."}
+	r := Report{RunID: c.RunID, Interrupted: interrupted, Stages: c.Stages, Scheduled: scheduled.Load(), Submitted: submitted.Load(), Started: m.started, Completed: m.completed, Success: m.success, Missed: missed.Load(), TransportErrors: m.networkErrors, ResponseErrors: m.responseErrors, SubmittedPayloadBytes: m.bytes, PayloadBytes: size, Concurrency: workers, Statuses: m.statuses, LatencyP50: percentile(m.latency, m.completed, .5, m.maxLatency).String(), LatencyP95: percentile(m.latency, m.completed, .95, m.maxLatency).String(), LatencyP99: percentile(m.latency, m.completed, .99, m.maxLatency).String(), StartLagP99: percentile(m.lag, m.started, .99, m.maxLag).String(), LoadSeconds: loadSeconds, TotalSeconds: time.Since(start).Seconds(), AchievedStartRPS: float64(m.started) / loadSeconds, HeapBytes: mem.HeapAlloc, Notes: "Success means HTTP 2xx, not persisted events. Payload bytes are attempted, not measured network bytes. Latencies include body reading; start lag is separate. Histogram percentiles are approximate upper bounds. Stages durations are nanoseconds. PayloadBytes is the maximum target body size. Success uses target expected_status, default 2xx."}
+	for i, t := range c.Targets {
+		r.Targets = append(r.Targets, TargetReport{t.Name, targetStarted[i].Load(), targetSuccess[i].Load(), targetErrors[i].Load()})
+	}
 	fmt.Fprintf(output, "finished: started=%d missed=%d success=%d actual=%.0fRPS p99=%s start_lag_p99=%s\n", r.Started, r.Missed, r.Success, r.AchievedStartRPS, r.LatencyP99, r.StartLagP99)
 	return r, nil
 }

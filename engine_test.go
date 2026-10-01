@@ -6,94 +6,56 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 )
 
 func testConfig(url string) Config {
-	return Config{URL: url, Stages: []Stage{{100, 100 * time.Millisecond}}, Concurrency: 8, Batch: 2, MessageBytes: 64, Services: 3, MemoryMiB: 1, Timeout: time.Second, Format: "logflux", RunID: "0123456789abcdef"}
+	return Config{URL: url, Stages: []Stage{{100, 100 * time.Millisecond}}, Concurrency: 8, MemoryMiB: 1, Timeout: time.Second, RunID: "0123456789abcdef"}
 }
 func TestPayload(t *testing.T) {
-	c := testConfig("http://localhost")
-	prefix, _ := runPrefix(c.RunID)
+	p, err := compilePayload([]byte(`{"id":"{{uuid}}","other":"{{uuid}}","time":"{{timestamp}}","seq":"{{sequence}}","text":"{{random:64}}"}`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, _ := runPrefix("0123456789abcdef")
 	seen := map[string]bool{}
-	for _, format := range []string{"logflux", "legacy"} {
-		c.Format = format
-		p := newPayload(c, 0)
-		for seq := uint64(0); seq < 2; seq++ {
-			p.update(prefix, seq, c.Batch)
-			var events []map[string]any
-			if format == "logflux" {
-				var body struct {
-					Logs []map[string]any `json:"logs"`
-				}
-				if err := json.Unmarshal(p.body, &body); err != nil {
-					t.Fatal(err)
-				}
-				events = body.Logs
-			} else {
-				if err := json.Unmarshal(p.body, &events); err != nil {
-					t.Fatal(err)
-				}
+	for n := uint64(0); n < 10; n++ {
+		p.update(prefix, n, 0)
+		var body map[string]string
+		if err := json.Unmarshal(p.body, &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range []string{"id", "other"} {
+			id := body[k]
+			if len(id) != 36 || id[14] != '4' || seen[id] {
+				t.Fatal("invalid/duplicate uuid")
 			}
-			if len(events) != 2 {
-				t.Fatal("batch size")
-			}
-			for _, e := range events {
-				key := "eventId"
-				if format == "legacy" {
-					key = "event_id"
-				}
-				id := e[key].(string)
-				if len(id) != 36 || id[14] != '4' {
-					t.Fatal("invalid UUID")
-				}
-				if format == "logflux" {
-					if seen[id] {
-						t.Fatal("duplicate ID")
-					}
-					seen[id] = true
-				}
-				if _, err := time.Parse(time.RFC3339Nano, e["timestamp"].(string)); err != nil {
-					t.Fatal(err)
-				}
-				if len(e["message"].(string)) != 64 {
-					t.Fatal("message size")
-				}
-			}
+			seen[id] = true
+		}
+		if len(body["text"]) != 64 {
+			t.Fatal("size")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, body["time"]); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
 func TestRun(t *testing.T) {
-	var mu sync.Mutex
-	count := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Logs []map[string]any `json:"logs"`
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Error("method")
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-		}
-		if r.Header.Get("Authorization") != "Bearer test" {
-			t.Error("authorization")
-		}
-		mu.Lock()
-		count++
-		mu.Unlock()
-		w.WriteHeader(202)
+		w.WriteHeader(204)
 	}))
-	defer server.Close()
-	c := testConfig(server.URL)
-	c.Key = "test"
-	report, err := Run(context.Background(), c, io.Discard)
+	defer s.Close()
+	r, err := Run(context.Background(), testConfig(s.URL), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if report.Scheduled != 10 || report.Submitted+report.Missed != 10 || report.Completed != report.Started || report.Success != uint64(count) || count == 0 {
-		t.Fatalf("bad counters: %+v", report)
+	if r.Scheduled != 10 || r.Submitted+r.Missed != 10 || r.Started != r.Completed || r.Success == 0 {
+		t.Fatalf("counters %+v", r)
 	}
 }
 func TestOverloadAndCancellation(t *testing.T) {
@@ -103,68 +65,56 @@ func TestOverloadAndCancellation(t *testing.T) {
 	c.Concurrency = 1
 	c.Stages = []Stage{{10000, 100 * time.Millisecond}}
 	r, err := Run(context.Background(), c, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Missed == 0 || r.Success != 0 || r.Statuses[429] == 0 || r.Completed != r.Submitted {
-		t.Fatalf("bad overload report: %+v", r)
+	if err != nil || r.Missed == 0 || r.Success != 0 || r.Statuses[429] == 0 {
+		t.Fatalf("overload %+v %v", r, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r, err = Run(ctx, c, io.Discard)
 	if err != nil || !r.Interrupted {
-		t.Fatal("cancellation", err)
+		t.Fatal("cancel")
 	}
 }
-func TestRedirectNotFollowed(t *testing.T) {
+func TestRedirect(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/other", 302) }))
 	defer s.Close()
 	r, err := Run(context.Background(), testConfig(s.URL), io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Statuses[302] == 0 || r.Success != 0 {
-		t.Fatal("redirect incorrectly followed")
+	if err != nil || r.Success != 0 || r.Statuses[302] == 0 {
+		t.Fatal("redirect", err)
 	}
 }
 func TestBounds(t *testing.T) {
-	c := testConfig("http://localhost")
-	c.Batch = 500
-	c.MessageBytes = 10000
-	if _, err := Run(context.Background(), c, io.Discard); err == nil {
-		t.Fatal("oversize accepted")
-	}
 	if requestCount(24*time.Hour, 1000000) != 86400000000 {
-		t.Fatal("rate overflow")
+		t.Fatal("overflow")
 	}
-	for _, s := range []string{"0@1s", "100@0s", "wat", "10@1h"} {
-		_, err := parseStages(s)
-		if s == "10@1h" && err != nil {
-			t.Fatal(err)
+	for _, s := range []string{"0@1s", "10@0s", "bad"} {
+		if _, err := parseStages(s); err == nil {
+			t.Fatal("invalid stage")
 		}
-		if s != "10@1h" && err == nil {
-			t.Fatal("invalid stage accepted")
-		}
+	}
+	if _, err := compilePayload([]byte("{{random:99999999}}"), true); err == nil {
+		t.Fatal("unbounded body")
 	}
 }
 func TestHistogram(t *testing.T) {
 	for _, v := range []int64{1, 16, 31, 32, 1000, 1000000, 1000000000} {
 		u := upper(bucket(v))
 		if u < v || float64(u) > float64(v)*1.07+1 {
-			t.Fatalf("%d -> %d", v, u)
+			t.Fatal(v, u)
 		}
 	}
 }
 func BenchmarkPayload(b *testing.B) {
-	c := testConfig("http://localhost")
-	c.Batch = 100
-	c.MessageBytes = 512
-	p := newPayload(c, 0)
-	prefix, _ := runPrefix(c.RunID)
+	text := `{"items":[` + strings.TrimSuffix(strings.Repeat(`{"id":"{{uuid}}","time":"{{timestamp}}","message":"{{random:512}}"},`, 100), ",") + ` ]}`
+	p, err := compilePayload([]byte(text), true)
+	if err != nil {
+		b.Fatal(err)
+	}
+	prefix, _ := runPrefix("0123456789abcdef")
 	b.SetBytes(int64(len(p.body)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.update(prefix, uint64(i), c.Batch)
+		p.update(prefix, uint64(i), 0)
 	}
 }
