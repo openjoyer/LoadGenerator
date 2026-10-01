@@ -1,0 +1,4 @@
+/bin/
+/report*.json
+*.prof
+.idea/
